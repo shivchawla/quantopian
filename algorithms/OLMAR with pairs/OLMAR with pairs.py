@@ -1,0 +1,206 @@
+# Adapted from:
+# Li, Bin, and Steven HOI. "On-Line Portfolio Selection with Moving Average Reversion." The 29th International Conference on Machine Learning (ICML2012), 2012.
+# http://icml.cc/2012/papers/168.pdf
+
+import numpy as np
+import pandas as pd
+import datetime
+import random
+from scipy import optimize
+
+
+def initialize(context):
+    
+    
+    context.eps = 1.01
+    context.turnover = 0.05
+    context.pct_index = 1.0 # max percentage of inverse ETF
+    context.leverage = 1.0
+    context.indices = symbols('OIL','GLD','TLT')
+    context.r1 = 1
+    context.r2 = 21
+    context.btret = 0.1
+    
+    # context.pairs = [(sid(8554), sid(41382)), (sid(19658), sid(41959))] 
+    context.stocks = symbols('SPY','SPLV','XSW','XLK','QQQ','ESPO') 
+    
+    print('context.eps = ' + str(context.eps))
+    print('context.pct_index = ' + str(context.pct_index))
+    print('context.leverage = ' + str(context.leverage))
+    
+    schedule_function(trade, date_rules.every_day(), time_rules.market_open(minutes=60))
+    set_benchmark(symbol('QQQ'))
+    set_commission(commission.PerShare(cost=0, min_trade_cost=0))
+    set_slippage(slippage.FixedSlippage(spread=0))
+    
+    context.data = []
+ 
+def before_trading_start(context,data): 
+    context.stocks = symbols('SPY', 'SPLV', 'XSW', 'XLK', 'QQQ', 'ESPO') 
+    
+    #context.stocks.append(symbols('SH')[0]) # add inverse ETF to universe
+    #context.stocks.append(symbol('SPY'))
+               
+    
+    # check if data exists
+    #for stock in context.stocks:
+     #   if stock not in context.data:
+      #      context.stocks.remove(stock)
+    
+
+def trade(context,data):
+    
+    prices = history(20*390,'1m','price')[context.stocks].dropna(axis=1)
+    context.stocks = list(prices.columns.values)
+    
+    if len(context.stocks) == 0:
+        return
+    
+    # skip bar if any orders are open
+    for stock in context.stocks:
+        if bool(get_open_orders(stock)):
+            return
+    
+    sum_weighted_port = np.zeros(len(context.stocks))
+    sum_weights = 0
+    
+    for n in range(context.r1,context.r2):
+        (weight,weighted_port) = get_allocation(context,data,prices.tail(n*390))
+        sum_weighted_port += weight * weighted_port
+        sum_weights += weight
+        
+    allocation_optimum = sum_weighted_port/sum_weights
+    #record(ret = sum_weights / 20.0)
+        
+    rebalance_portfolio(data, context, allocation_optimum)
+
+    
+def get_allocation(context,data,prices):
+    
+    prices = pd.ewma(prices,span=390).as_matrix(context.stocks)
+    
+    b_t = np.zeros(len(context.stocks))
+    
+    # update portfolio
+    for i, stock in enumerate(context.stocks):
+        b_t[i] = abs(context.portfolio.positions[stock].amount*data[stock].price)
+         
+    denom = np.sum(b_t)
+    # test for divide-by-zero case
+    if denom > 0:
+        b_t = np.divide(b_t,denom)
+    else:     
+        b_t = np.ones(len(context.stocks)) / len(context.stocks)
+
+    x_tilde = np.zeros(len(context.stocks))
+    
+    b_0 = np.ones(len(context.stocks)) / len(context.stocks)
+    
+    context.ls = {}
+    for stock in context.stocks:
+        context.ls[stock] = 0
+    
+    # find relative moving volume weighted average price for each secuirty
+    for i,stock in enumerate(context.stocks):
+        mean_price = np.mean(prices[:,i])
+        x_tilde[i] = (1.0*mean_price/prices[-1,i]) + (0.0*prices[-1,i]/mean_price)
+    
+    for i,stock in enumerate(context.stocks): 
+        price_rel = x_tilde[i]
+        if price_rel < 1:
+            x=1
+            price_rel = 0 #1.0/price_rel
+        x_tilde[i] = price_rel
+        
+    x_bar = x_tilde.mean()
+    #x_tilde = x_tilde - x_bar + 1
+        
+    bnds = []
+    limits = [0.0,1]
+    
+    for stock in context.stocks:
+            bnds.append(limits)
+        
+    bnds = tuple(tuple(x) for x in bnds)
+     
+    cons = ({'type': 'eq', 'fun': lambda x:  np.sum(x)-1.0},{'type': 'ineq', 'fun': lambda x: np.dot(x,x_tilde) - context.eps})# {'type': 'ineq','fun': lambda x: context.turnover - np.sum(abs(x-b_t))})
+    
+    
+   
+   # res = optimize.minimize(totalreturn, b_t, args=x_tilde, method='SLSQP', constraints=cons, bounds=bnds)
+    
+    res = optimize.minimize(norm_squared, b_0, args=(b_t,x_tilde),method='SLSQP',constraints=cons,bounds=bnds, options={'disp': False,  'maxiter': 1000, 'iprint': 1, 'ftol': 1e-6})
+    
+    allocation = res.x
+    allocation[allocation<0] = 0 
+    allocation = allocation/np.sum(allocation)
+    
+    if res.success and (np.dot(allocation,x_tilde) - context.eps > 0.0):
+        return (np.dot(allocation,x_tilde), allocation)
+    else:
+        return (0.1, b_t)
+    
+    
+    sum_weighted_port = np.zeros(len(context.stocks))
+    sum_weights = 0
+    
+    
+    for j in range(1,11):
+        for k,stock in enumerate(context.stocks):
+            b_0[k] = random.uniform(0, 1)
+        b_0 = b_0/sum(b_0) 
+            
+        res = optimize.minimize(norm_squared, b_0, args=(b_t,x_tilde),method='SLSQP',constraints=cons,bounds=bnds, options={'disp': False,  'maxiter': 1000, 'iprint': 1, 'ftol': 1e-6})
+    
+    
+        allocation = res.x
+        allocation[allocation<0] = 0 
+        allocation = allocation/np.sum(allocation)
+    
+        if res.success and (np.dot(allocation,x_tilde) - context.eps > 0.0):
+           sum_weighted_port += np.dot(allocation,x_tilde)*allocation  
+           sum_weights += np.dot(allocation,x_tilde)
+    
+    if sum_weights > 0:
+        return (sum_weights/10, sum_weighted_port / sum_weights)
+    else:
+        return (0.1, b_t)
+        
+    
+
+def rebalance_portfolio(data, context, desired_port):
+    
+    record(long = sum(desired_port))
+    #record(inverse = desired_port[-1])
+    
+    for i, stock in enumerate(context.stocks):
+        order_target_percent(stock, context.leverage*desired_port[i])
+    
+    for stock in data:
+        if stock not in context.stocks and stock not in context.indices:
+            order_target_percent(stock,0)     
+       
+        
+def norm_squared(b,*args):
+    
+    b_t = np.asarray(args[0])
+        
+    delta_b = b - b_t
+     
+    return 0.5*np.dot(delta_b,delta_b.T)
+
+def norm_squared_deriv(b,*args):
+    
+    b_t = np.asarray(args)
+    delta_b = b - b_t
+        
+    return delta_b
+
+def totalreturn(b, *args): 
+    u = np.array(args[0]) #np.asarray(args)
+   # log.info(u.shape)
+    u = u.T
+   # log.info(u.shape)
+    return -np.dot(b, u)
+                              
+def totalreturn_grad(*args):     return -np.array(args[0])
